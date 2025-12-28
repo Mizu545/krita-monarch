@@ -71,12 +71,15 @@ public:
         NoHandle,
         StartPos,
         EndPos,
-        Ascender,
+
+        /// The text properties handles.
         BaselineShift,
+        Ascender,
         Descender,
         LineHeightTop,
         LineHeightBottom,
 
+        /// Baselines.
         BaselineAlphabetic,
         BaselineIdeographic,
         BaselineMiddle,
@@ -346,6 +349,9 @@ private Q_SLOTS:
      */
     void removeTransformsFromRange();
 
+    /// Update the canvas resources with fore and background color.
+    void updateCanvasResources();
+
 private:
 
     /**
@@ -377,9 +383,6 @@ private:
     /// This applies any running IME interactions, used when the shape is
     /// deselected halfways through an IME interaction.
     void commitIMEPreEdit();
-
-    /// Update the canvas resources with fore and background color.
-    void updateCanvasResources();
 
     struct Private;
     const QScopedPointer<Private> d;

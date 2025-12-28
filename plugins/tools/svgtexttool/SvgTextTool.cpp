@@ -99,8 +99,8 @@ static bool debugEnabled()
 
 SvgTextTool::SvgTextTool(KoCanvasBase *canvas)
     : KoToolBase(canvas)
-    , m_textCursor(canvas)
     , m_optionManager(new SvgTextToolOptionsManager(this))
+    , m_textCursor(canvas)
     , m_textOutlineHelper(new KoSvgTextShapeOutlineHelper(canvas))
 {
      // TODO: figure out whether we should use system config for this, Windows and GTK have values for it, but Qt and MacOS don't(?).
@@ -244,6 +244,7 @@ QWidget *SvgTextTool::createOptionWidget()
     optionWidget->setSizePolicy(QSizePolicy::MinimumExpanding, QSizePolicy::MinimumExpanding);
     optionWidget->setSource(QUrl("qrc:/SvgTextToolOptions.qml"));
 
+    m_optionManager->optionsModel()->setConfigName(this->toolId());
     m_optionManager->setShowDebug(debugEnabled());
     if (optionWidget->errors().isEmpty()) {
         optionWidget->rootObject()->setProperty("manager", QVariant::fromValue(m_optionManager.data()));
@@ -578,21 +579,27 @@ void SvgTextTool::slotTextTypeUpdated()
 {
     KoSvgTextShape *shape = selectedShape();
     QActionGroup *typeConvertGroup = action("text_type_preformatted")->actionGroup();
-    typeConvertGroup->setExclusive(true);
+    if (typeConvertGroup) {
+        typeConvertGroup->setExclusive(true);
+    }
     Q_FOREACH (QAction *a, typeConvertGroup->actions()) {
         a->setCheckable(true);
     }
     if (m_optionManager) {
         if (shape) {
             m_optionManager->convertToTextType(int(shape->textType()));
-            typeConvertGroup->setEnabled(true);
+            if (typeConvertGroup) {
+                typeConvertGroup->setEnabled(true);
+            }
             action("text_type_preformatted")->setChecked(shape->textType() == KoSvgTextShape::PreformattedText);
             action("text_type_pre_positioned")->setChecked(shape->textType() == KoSvgTextShape::PrePositionedText);
             action("text_type_inline_wrap")->setChecked(shape->textType() == KoSvgTextShape::InlineWrap);
 
         } else {
             m_optionManager->convertToTextType(-1);
-            typeConvertGroup->setEnabled(false);
+            if (typeConvertGroup) {
+                typeConvertGroup->setEnabled(false);
+            }
         }
         const bool enableTypeSetting = (m_optionManager->typeSettingMode() && shape && (shape->textType() == KoSvgTextShape::PreformattedText ||shape->textType() == KoSvgTextShape::PrePositionedText));
         action("svg_type_setting_move_selection_start_down_1_px")->actionGroup()->setEnabled(enableTypeSetting);
@@ -678,13 +685,12 @@ void SvgTextTool::paint(QPainter &gc, const KoViewConverter &converter)
         KisHandlePainterHelper handlePainter =
             KoShape::createHandlePainterHelperView(&gc, shape, converter, handleRadius(), decorationThickness());
 
-        if (m_dragging != DragMode::InlineSizeHandle && m_dragging != DragMode::Move) {
+        if (m_dragging != DragMode::InlineSizeHandle && m_dragging != DragMode::Move && m_dragging != DragMode::TypeSetting) {
             handlePainter.setHandleStyle(KisHandleStyle::primarySelection());
             QPainterPath path;
             path.addRect(shape->outlineRect());
             handlePainter.drawPath(path);
         }
-
 
         qreal pxlToPt = canvas()->viewConverter()->viewToDocumentX(1.0);
         qreal length = (INLINE_SIZE_DASHES_PATTERN_A + INLINE_SIZE_DASHES_PATTERN_B) * INLINE_SIZE_DASHES_PATTERN_LENGTH;
@@ -784,6 +790,7 @@ void SvgTextTool::mousePressEvent(KoPointerEvent *event)
             if (handle != SvgTextCursor::NoHandle) {
                 if (!m_textCursor.setDominantBaselineFromHandle(handle)) {
                     m_interactionStrategy.reset(new SvgTextTypeSettingStrategy(this, selectedShape, &m_textCursor, handleGrabRect(event->point), event->modifiers()));
+                    m_dragging = DragMode::TypeSetting;
                     m_textCursor.setDrawTypeSettingHandle(false);
                 }
                 event->accept();

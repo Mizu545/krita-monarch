@@ -269,11 +269,14 @@ void KisCanvasController::mirrorCanvasAroundCanvas(bool enable)
 void KisCanvasController::Private::showRotationValueOnCanvas()
 {
     qreal rotationAngle = coordinatesConverter->rotationAngle();
+    // Prevent the displayed rotation angle from jittering between -0.0 and 0.0.
+    if (rotationAngle > -0.05 && rotationAngle < 0.05) {
+        rotationAngle = 0.0;
+    }
     view->viewManager()->
-        showFloatingMessage(
+        showFloatingRotationMessage(
             i18nc("floating message about rotation", "Rotation: %1° ",
-                  KritaUtils::prettyFormatReal(rotationAngle)),
-            QIcon(), 500, KisFloatingMessage::Low, Qt::AlignCenter);
+                  KritaUtils::prettyFormatReal(rotationAngle)));
 }
 
 void KisCanvasController::beginCanvasRotation()

@@ -1339,6 +1339,9 @@ bool KoSvgTextShape::setCharacterTransformsOnRange(const int startPos, const int
                             tf.xPos = p.x();
                             tf.yPos = p.y();
                         }
+                        if (!tf.rotate) {
+                            tf.rotate = 0.0;
+                        }
                     }
                     transforms << tf;
                     continue;
@@ -1427,7 +1430,8 @@ QList<KoSvgTextCharacterInfo> KoSvgTextShape::getPositionsAndRotationsForRange(c
     }
 
     if (endIndex == startIndex) {
-        CharacterResult resFinal = d->result.value(startIndex);
+        bool final = qMax(startPos, endPos) == finalPos;
+        CharacterResult resFinal = final? d->result.last(): d->result.value(startIndex);
         if (resFinal.addressable) {
             infos << infoFromCharacterResult(resFinal, startIndex);
         }

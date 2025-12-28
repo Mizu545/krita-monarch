@@ -27,6 +27,7 @@
 #include "KoCanvasResourceProvider.h"
 #include <kis_signal_compressor.h>
 #include <KisHandlePainterHelper.h>
+#include <kis_acyclic_signal_connector.h>
 
 #include "kundo2command.h"
 #include <QTimer>
@@ -112,6 +113,10 @@ struct TypeSettingDecorInfo {
     QMap<SvgTextCursor::TypeSettingModeHandle, QPainterPath> baselines;
     QMap<SvgTextCursor::TypeSettingModeHandle, QPainterPath> paths;
 
+    QPainterPath edges;
+    QMap<SvgTextCursor::TypeSettingModeHandle, QPainterPath> parentPaths;
+    QMap<SvgTextCursor::TypeSettingModeHandle, QPainterPath> parentBaselines;
+
     QPointF closestBaselinePoint;
 
     QRectF boundingRect(qreal handleRadius) {
@@ -122,6 +127,13 @@ struct TypeSettingDecorInfo {
         for (int i = 0; i< baselines.values().size(); i++) {
             total |= baselines.values().at(i).boundingRect();
         }
+        for (int i = 0; i< parentPaths.values().size(); i++) {
+            total |= parentPaths.values().at(i).boundingRect();
+        }
+        for (int i = 0; i< parentBaselines.values().size(); i++) {
+            total |= parentBaselines.values().at(i).boundingRect();
+        }
+        total |= edges.boundingRect();
         QRectF rect(0, 0, handleRadius, handleRadius);
         rect.moveCenter(handles.first);
         total |= rect;
@@ -133,6 +145,7 @@ struct TypeSettingDecorInfo {
     bool testBaselines(Qt::KeyboardModifiers modifiers) {
         return (modifiers & Qt::ShiftModifier);
     }
+
 };
 
 struct Q_DECL_HIDDEN SvgTextCursor::Private {
@@ -227,12 +240,15 @@ struct Q_DECL_HIDDEN SvgTextCursor::Private {
     SvgTextCursorPropertyInterface *interface{nullptr};
 
     QList<QAction*> actions;
+
+    KisAcyclicSignalConnector resourceManagerAcyclicConnector;
 };
 
 SvgTextCursor::SvgTextCursor(KoCanvasBase *canvas) :
     d(new Private)
 {
     d->canvas = canvas;
+    d->interface = new SvgTextCursorPropertyInterface(this);
     if (d->canvas->canvasController()) {
         // Mockcanvas in the tests has no canvas controller.
         connect(d->canvas->canvasController()->proxyObject, SIGNAL(sizeChanged(QSize)), this, SLOT(updateInputMethodItemTransform()));
@@ -252,10 +268,12 @@ SvgTextCursor::SvgTextCursor(KoCanvasBase *canvas) :
                 SIGNAL(documentMirrorStatusChanged(bool, bool)),
                 this,
                 SLOT(updateInputMethodItemTransform()));
-        connect(d->canvas->resourceManager(), SIGNAL(canvasResourceChanged(int,QVariant)),
-                this, SLOT(canvasResourceChanged(int,QVariant)));
+        d->resourceManagerAcyclicConnector.connectBackwardResourcePair(
+                    d->canvas->resourceManager(), SIGNAL(canvasResourceChanged(int,QVariant)),
+                    this, SLOT(canvasResourceChanged(int,QVariant)));
+        d->resourceManagerAcyclicConnector.connectForwardVoid(d->interface, SIGNAL(textCharacterSelectionChanged()), this, SLOT(updateCanvasResources()));
     }
-    d->interface = new SvgTextCursorPropertyInterface(this);
+
 }
 
 SvgTextCursor::~SvgTextCursor()
@@ -512,7 +530,7 @@ bool SvgTextCursor::setDominantBaselineFromHandle(const TypeSettingModeHandle ha
     mergePropertiesIntoSelection(props);
     return true;
 }
-// The baselines that need to get precendence over the others need to go later in the list.
+
 QMap<SvgTextCursor::TypeSettingModeHandle, int> typeSettingBaselinesFromMetrics(const KoSvgText::FontMetrics metrics, const qreal lineGap, const bool isHorizontal) {
     return QMap<SvgTextCursor::TypeSettingModeHandle, int> {
         {SvgTextCursor::Ascender, metrics.ascender},
@@ -607,7 +625,7 @@ void SvgTextCursor::insertRichText(KoSvgTextShape *insert, bool inheritPropertie
             addCommandToUndoAdapter(removeCmd);
         }
 
-        SvgTextInsertRichCommand *cmd = new SvgTextInsertRichCommand(d->shape, insert, d->pos, d->anchor);
+        SvgTextInsertRichCommand *cmd = new SvgTextInsertRichCommand(d->shape, insert, d->pos, d->anchor, inheritPropertiesIfPossible);
         addCommandToUndoAdapter(cmd);
 
     }
@@ -860,23 +878,32 @@ void SvgTextCursor::paintDecorations(QPainter &gc, QColor selectionColor, int de
 
             QMap<SvgTextCursor::TypeSettingModeHandle, QPainterPath> paths
                     = d->typeSettingDecor.testBaselines(d->lastKnownModifiers)? d->typeSettingDecor.baselines: d->typeSettingDecor.paths;
+            QMap<SvgTextCursor::TypeSettingModeHandle, QPainterPath> parentPaths
+                    = d->typeSettingDecor.testBaselines(d->lastKnownModifiers)? d->typeSettingDecor.parentBaselines: d->typeSettingDecor.parentPaths;
             Q_FOREACH(SvgTextCursor::TypeSettingModeHandle handle, paths.keys()) {
                 const QPainterPath p = paths.value(handle);
+                const QPainterPath parent = parentPaths.value(handle);
                 if (d->hoveredTypeSettingHandle == handle) {
                     helper.setHandleStyle(highlight);
+                    helper.drawPath(parent);
                     helper.drawPath(p);
-
-
                 } else {
                     gc.save();
                     QPen pen(selectionColor, decorationThickness, handle == BaselineShift? Qt::SolidLine: Qt::DashLine);
                     pen.setCosmetic(true);
                     gc.setPen(pen);
                     gc.setOpacity(0.5);
+                    gc.drawPath(painterTf.map(parent));
                     gc.drawPath(painterTf.map(p));
                     gc.restore();
                 }
-
+                gc.save();
+                QPen pen(selectionColor, decorationThickness, Qt::SolidLine);
+                pen.setCosmetic(true);
+                gc.setPen(pen);
+                gc.setOpacity(0.5);
+                gc.drawPath(painterTf.map(d->typeSettingDecor.edges));
+                gc.restore();
             }
 
             if (d->typeSettingDecor.handlesEnabled) {
@@ -1279,20 +1306,24 @@ void SvgTextCursor::canvasResourceChanged(int key, const QVariant &value)
         return;
 
     KoSvgTextProperties props;
-    KoSvgTextProperties shapeProps = hasSelection()? d->shape->propertiesForPos(d->pos, true): d->shape->textProperties();
+    KoSvgTextProperties shapeProps = hasSelection()? d->shape->propertiesForPos(qMin(d->pos, d->anchor), true): d->shape->textProperties();
     if (key == KoCanvasResource::ForegroundColor) {
         QSharedPointer<KoShapeBackground> bg(new KoColorBackground(value.value<KoColor>().toQColor()));
-        if (bg != shapeProps.background()) {
+        if (!bg->compareTo(shapeProps.background().data())
+                || !shapeProps.hasProperty(KoSvgTextProperties::FillId)) {
             props.setProperty(KoSvgTextProperties::FillId,
                               QVariant::fromValue(KoSvgText::BackgroundProperty(bg)));
         }
     } else if (key == KoCanvasResource::BackgroundColor) {
         QSharedPointer<KoShapeStroke> stroke(new KoShapeStroke());
-        if (shapeProps.stroke()) {
-            stroke = qSharedPointerDynamicCast<KoShapeStroke>(shapeProps.stroke());
+        if (shapeProps.hasProperty(KoSvgTextProperties::StrokeId)) {
+            KoShapeStrokeSP shapeStroke = qSharedPointerDynamicCast<KoShapeStroke>(shapeProps.stroke());
+            if (shapeStroke->isVisible()) {
+                stroke.reset(new KoShapeStroke(*shapeStroke));
+            }
         }
         stroke->setColor(value.value<KoColor>().toQColor());
-        if (stroke != shapeProps.stroke()) {
+        if (!stroke->compareFillTo(shapeProps.stroke().data()) || !shapeProps.hasProperty(KoSvgTextProperties::StrokeId)) {
             props.setProperty(KoSvgTextProperties::StrokeId,
                               QVariant::fromValue(KoSvgText::StrokeProperty(stroke)));
         }
@@ -1676,7 +1707,6 @@ void SvgTextCursor::updateCursor(bool firstUpdate)
     if (!d->blockQueryUpdates) {
         qApp->inputMethod()->update(Qt::ImQueryInput);
     }
-    updateCanvasResources();
     d->interface->emitCharacterSelectionChange();
     if (!(d->canvas->canvasWidget() && d->canvas->canvasController())) {
         // Mockcanvas in the tests has neither.
@@ -1735,6 +1765,69 @@ void SvgTextCursor::updateIMEDecoration()
     }
 }
 
+/// Lineheight calculation is a little tricky sometimes...
+/// Maybe we should generalize this so the one in the layout and this one uses the same base function.
+int calcLineHeight(const KoSvgText::LineHeightInfo &lineHeight, const KoSvgText::FontMetrics &metrics, const qreal scaleMetrics) {
+    if (!lineHeight.isNormal) {
+        if (lineHeight.isNumber) {
+            return (lineHeight.value * (metrics.ascender-metrics.descender))-(metrics.ascender-metrics.descender);
+        } else {
+            return (lineHeight.length.value/scaleMetrics)-(metrics.ascender-metrics.descender);
+        }
+    }
+    return metrics.lineGap;
+}
+
+void processBaseline(const SvgTextCursor::TypeSettingModeHandle handle,
+                     const int metric, const bool isHorizontal,
+                     QTransform t,
+                     const qreal scaleMetrics, const QPointF &advance,
+                     QMap<SvgTextCursor::TypeSettingModeHandle, QPainterPath> &decor){
+    QPointF offset = isHorizontal? QPointF(0, -(metric*scaleMetrics)): QPointF(metric*scaleMetrics, 0);
+
+    QPainterPath p = decor.value(handle);
+
+    const QPointF startPos = t.map(offset);
+    const QPointF endPos = t.map(offset+advance);
+    if (p.currentPosition() != startPos) {
+        p.moveTo(startPos);
+    }
+    p.lineTo(endPos);
+
+    decor.insert(handle, p);
+}
+
+void processEdges(QTransform t, QMap<SvgTextCursor::TypeSettingModeHandle, int> values,
+                  const bool isHorizontal,
+                  const qreal scaleMetrics,
+                  const QPointF advance,
+                  QPainterPath &path) {
+    QPointF p1(values.first(), 0);
+    QPointF p2(values.last(), 0);
+    Q_FOREACH(const int val, values) {
+        if (val < p1.x()) {
+            p1.setX(val);
+        }
+        if (val > p2.x()) {
+            p2.setX(val);
+        }
+    }
+    if (isHorizontal) {
+        p1 = QPointF(p1.y(), -p1.x());
+        p2 = QPointF(p2.y(), -p2.x());
+    }
+    p1 *= scaleMetrics;
+    p2 *= scaleMetrics;
+    path.moveTo(t.map(p1+advance));
+    path.lineTo(t.map(p2+advance));
+}
+
+QTransform posAndRotateTransform(const QPointF pos, const qreal rotateDeg) {
+    QTransform t = QTransform::fromTranslate(pos.x(), pos.y());
+    t.rotate(rotateDeg);
+    return t;
+}
+
 void SvgTextCursor::updateTypeSettingDecoration()
 {
     QRectF updateRect;
@@ -1768,53 +1861,123 @@ void SvgTextCursor::updateTypeSettingDecoration()
         t.rotate(last.rotateDeg);
         last.finalPos = t.map(last.advance);
 
-        //
         d->typeSettingDecor.handles.first = rtl? last.finalPos: first.finalPos;
         d->typeSettingDecor.handles.second = rtl? first.finalPos: last.finalPos;
 
-        // This could be better, it's quite clunky right now.
-        // It'd be better if we could get KoSvgTextNodeIndex for a pos, but that one is only implemented in shape branch...
+        //Start collecting the metrics decoration...
         d->typeSettingDecor.paths = QMap<SvgTextCursor::TypeSettingModeHandle, QPainterPath>();
         d->typeSettingDecor.baselines = QMap<SvgTextCursor::TypeSettingModeHandle, QPainterPath>();
+        d->typeSettingDecor.edges = QPainterPath();
+        d->typeSettingDecor.parentPaths = QMap<SvgTextCursor::TypeSettingModeHandle, QPainterPath>();
+        d->typeSettingDecor.parentBaselines = QMap<SvgTextCursor::TypeSettingModeHandle, QPainterPath>();
         QList<KoSvgTextCharacterInfo> metricInfos = infos;
         if (d->pos == d->anchor) {
             metricInfos = d->shape->getPositionsAndRotationsForRange(0, d->shape->posForIndex(d->shape->plainText().size()));
         }
+        const bool isHorizontal = d->shape->writingMode() == KoSvgText::HorizontalTB;
+        const int minPos = qMin(d->pos, d->anchor);
+        const int maxPos = qMax(d->pos, d->anchor);
+        const int endPos = d->shape->posForIndex(d->shape->plainText().size());
+
+        /// This adds the start and end decoration...
+        if (minPos > 0 || maxPos < endPos) {
+            const KoSvgTextProperties props = d->shape->textProperties();
+            KoSvgText::LineHeightInfo lineHeight = props.propertyOrDefault(KoSvgTextProperties::LineHeightId).value<KoSvgText::LineHeightInfo>();
+            KoSvgText::FontMetrics metrics = props.metrics(true, true);
+            const qreal scaleMetrics = props.fontSize().value/qreal(metrics.fontSize);
+            const int lineGap = calcLineHeight(lineHeight, metrics, scaleMetrics);
+
+            const QMap<SvgTextCursor::TypeSettingModeHandle, int> types
+                    = typeSettingBaselinesFromMetrics(metrics, lineGap, isHorizontal);
+
+            QList<KoSvgTextCharacterInfo> parentInfos;
+            QList<int> positions;
+            positions << 0;
+            positions << qMax(0, minPos-1);
+            positions << maxPos;
+            positions << endPos;
+
+            Q_FOREACH(const int pos, positions) {
+                QList<KoSvgTextCharacterInfo> info =
+                        d->shape->getPositionsAndRotationsForRange(pos, pos);
+                parentInfos.append(info.first());
+            }
+
+            QPointF drawOffset = isHorizontal? QPointF(d->handleRadius*2, 0): QPointF(0, d->handleRadius*2);
+            if (d->canvas) {
+                drawOffset = d->canvas->viewConverter()->viewToDocument().map(drawOffset);
+            }
+            bool toggleOffset = rtl;
+
+            for (auto it = parentInfos.begin(); it != parentInfos.end(); it++) {
+                const bool currentIsMin = (d->shape->posForIndex(it->logicalIndex) == minPos);
+                const QPointF finalPos = toggleOffset? it->finalPos + (it->advance - drawOffset): it->finalPos;
+                const QPointF advance = drawOffset;
+
+                const QTransform t = posAndRotateTransform(finalPos, it->rotateDeg);
+
+                Q_FOREACH(SvgTextCursor::TypeSettingModeHandle handle, types.keys()) {
+                    const int metric = types.value(handle);
+                    processBaseline(handle, metric, isHorizontal, t, scaleMetrics, advance, d->typeSettingDecor.parentBaselines);
+                }
+
+                {
+
+                    if (currentIsMin && minPos == maxPos && !toggleOffset) {
+                        toggleOffset = !toggleOffset;
+                        continue;
+                    }
+                    const QPointF advance = toggleOffset? it->advance: QPointF();
+                    const QTransform t = posAndRotateTransform(it->finalPos, it->rotateDeg);
+                    processEdges(t, types, isHorizontal, scaleMetrics, advance, d->typeSettingDecor.edges);
+                }
+
+                toggleOffset = !toggleOffset;
+            }
+        }
+
+        /// This could be better but requires better nodeindex retrieval...
+        bool toggleOffset = false; // MetricInfos are visually-ordered.
         for (auto it = metricInfos.begin(); it != metricInfos.end(); it++) {
             const int currentPos = (d->pos == d->anchor)? -1 :d->shape->posForIndex(it->logicalIndex);
-            const KoSvgTextProperties props = d->shape->propertiesForPos(currentPos, true);
-            KoSvgText::LineHeightInfo lineHeight = props.propertyOrDefault(KoSvgTextProperties::LineHeightId).value<KoSvgText::LineHeightInfo>();
 
-            KoSvgText::FontMetrics metrics = (d->pos == d->anchor)? props.metrics(true, true) :it->metrics;
-            const bool isHorizontal = d->shape->writingMode() == KoSvgText::HorizontalTB;
+            KoSvgTextProperties props = d->shape->propertiesForPos(currentPos, true);
+            KoSvgText::LineHeightInfo lineHeight = props.propertyOrDefault(KoSvgTextProperties::LineHeightId).value<KoSvgText::LineHeightInfo>();
+            KoSvgText::FontMetrics propMetrics = props.metrics(true, true);
+
+            KoSvgText::FontMetrics metrics = (d->pos == d->anchor)? propMetrics :it->metrics;
 
             const qreal scaleMetrics = props.fontSize().value/qreal(metrics.fontSize);
-            const int lineGap = lineHeight.isNormal? metrics.lineGap: (lineHeight.length.value/scaleMetrics)-(metrics.ascender-metrics.descender);
+            const int lineGap = calcLineHeight(lineHeight, metrics, scaleMetrics);
 
-            QTransform t = QTransform::fromTranslate(it->finalPos.x(), it->finalPos.y());
-            t.rotate(it->rotateDeg);
+            const QTransform t = posAndRotateTransform(it->finalPos, it->rotateDeg);
 
             const QMap<SvgTextCursor::TypeSettingModeHandle, int> types
                     = typeSettingBaselinesFromMetrics(metrics, lineGap, isHorizontal);
 
             Q_FOREACH(SvgTextCursor::TypeSettingModeHandle handle, types.keys()) {
                 const int metric = types.value(handle);
-                QPointF offset = isHorizontal? QPointF(0, -(metric*scaleMetrics)): QPointF(metric*scaleMetrics, 0);
-                QPainterPath p = d->typeSettingDecor.baselines.value(handle);
-                p.moveTo(t.map(offset));
-                p.lineTo(t.map(offset+it->advance));
-                d->typeSettingDecor.baselines.insert(handle, p);
+                processBaseline(handle, metric, isHorizontal, t, scaleMetrics, it->advance, d->typeSettingDecor.baselines);
+            }
+            if ((currentPos == minPos || currentPos+1 == maxPos) && minPos != maxPos) {
+                const QPointF advance = toggleOffset? it->advance: QPointF();
+                toggleOffset = !toggleOffset;
+                processEdges(t, types, isHorizontal, scaleMetrics, advance, d->typeSettingDecor.edges);
             }
         }
+
+        /// Split up baselines into paths and baselines.
         const QList<SvgTextCursor::TypeSettingModeHandle> nonBaselines = {
             LineHeightTop, Ascender, BaselineShift, Descender, LineHeightBottom
         };
         Q_FOREACH(SvgTextCursor::TypeSettingModeHandle handle, nonBaselines) {
             d->typeSettingDecor.paths.insert(handle, d->typeSettingDecor.baselines.value(handle));
+            d->typeSettingDecor.parentPaths.insert(handle,  d->typeSettingDecor.parentBaselines.value(handle));
         }
         d->typeSettingDecor.baselines.remove(LineHeightTop);
         d->typeSettingDecor.baselines.remove(LineHeightBottom);
-
+        d->typeSettingDecor.parentBaselines.remove(LineHeightTop);
+        d->typeSettingDecor.parentBaselines.remove(LineHeightBottom);
 
         updateRect = d->shape->shapeToDocument(d->typeSettingDecor.boundingRect(d->handleRadius));
     }
@@ -1958,9 +2121,9 @@ void SvgTextCursor::updateCanvasResources()
     // Only update canvas resources when there's no selection.
     // This relies on Krita not setting anything on the text when there's no selection.
     if (d->shape && d->canvas->resourceManager() && d->pos == d->anchor) {
-        KoSvgTextProperties props = hasSelection()? d->shape->propertiesForPos(d->pos, true): d->shape->textProperties();
+        KoSvgTextProperties props = hasSelection()? d->shape->propertiesForPos(qMin(d->pos, d->anchor), true): d->shape->textProperties();
         KoColorBackground *bg = dynamic_cast<KoColorBackground *>(props.background().data());
-        if (bg) {
+        if (bg && props.hasProperty(KoSvgTextProperties::FillId)) {
             KoColor c;
             c.fromQColor(bg->color());
             c.setOpacity(1.0);
@@ -1969,7 +2132,7 @@ void SvgTextCursor::updateCanvasResources()
             }
         }
         KoShapeStroke *stroke = dynamic_cast<KoShapeStroke *>(props.stroke().data());
-        if (stroke && stroke->color().isValid()) {
+        if (stroke && stroke->isVisible() && stroke->color().isValid() && props.hasProperty(KoSvgTextProperties::StrokeId)) {
             KoColor c;
             c.fromQColor(stroke->color());
             c.setOpacity(1.0);

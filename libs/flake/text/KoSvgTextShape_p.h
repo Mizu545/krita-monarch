@@ -975,8 +975,9 @@ public:
                 }
             }
             if (transformOffset < currentTextElement->localTransformations.size()) {
+                int length = qBound(0, transformOffsetEnd-transformOffset, qMax(0, currentTextElement->localTransformations.size()-transformOffset));
                 currentTextElement->localTransformations.remove(transformOffset,
-                                                                qBound(0, transformOffsetEnd-transformOffset, currentTextElement->localTransformations.size()));
+                                                                length);
             }
 
         }
@@ -1285,7 +1286,8 @@ public:
                             && (siblingPrev->textPathId.isEmpty() && it->textPathId.isEmpty())
                             && (siblingPrev->textLength.isAuto && it->textLength.isAuto)
                             && (siblingPrev->properties == it->properties)
-                            && (bidi != KoSvgText::BidiIsolate && bidi != KoSvgText::BidiIsolateOverride)) {
+                            && (bidi != KoSvgText::BidiIsolate && bidi != KoSvgText::BidiIsolateOverride)
+                            && childCount(siblingPrev) == 0) {
                         // TODO: handle localtransforms better; annoyingly, this requires whitespace handling
                         siblingPrev->text += it->text;
                         tree.erase(siblingCurrent(it));
